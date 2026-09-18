@@ -171,7 +171,7 @@ jobs:
           # neither Codex nor R-CLI has a round cap, so this is their only
           # spend bound. Baked rather than dispatched: the input budget is
           # full (see MAIN_WORKFLOW_INPUTS).
-          agent-timeout: '900'
+          agent-timeout: '3600'
           mode: ${{ inputs.mode }}
           pin-arxiv: ${{ inputs.pin-arxiv }}
           publish: ${{ inputs.publish }}
