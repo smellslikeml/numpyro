@@ -474,6 +474,200 @@ class Cauchy(Distribution):
         return jnp.broadcast_to(jnp.log(4 * np.pi * self.scale), self.batch_shape)
 
 
+class ContinuousBernoulli(Distribution):
+    r"""The continuous Bernoulli distribution, a continuous distribution on the
+    unit interval :math:`[0, 1]` parameterized by a single shape parameter
+    :math:`\lambda` (:attr:`probs`). It is the continuous analogue of the
+    (discrete) Bernoulli distribution and was introduced to fix a pervasive
+    normalization error in variational autoencoders with a :math:`[0, 1]`-valued
+    likelihood (Loaiza-Ganem & Cunningham, *The continuous Bernoulli: fixing a
+    pervasive error in variational autoencoders*, NeurIPS 2019,
+    `arXiv:1907.06845 <https://arxiv.org/abs/1907.06845>`_).
+
+    The Probability Density Function (PDF) is:
+
+    .. math::
+        p(x \mid \lambda) = C(\lambda)\, \lambda^{x}\,(1 - \lambda)^{1 - x},
+        \quad x \in [0, 1]
+
+    where the normalizing constant is
+
+    .. math::
+        C(\lambda) = \begin{cases}
+            \dfrac{2\,\operatorname{artanh}(1 - 2\lambda)}{1 - 2\lambda}
+                & \text{if } \lambda \neq 0.5 \\[2ex]
+            2 & \text{if } \lambda = 0.5
+        \end{cases}
+
+    The point :math:`\lambda = 0.5` is a removable :math:`0/0` singularity of
+    :math:`C`, the mean, the variance, and the inverse CDF; near it the closed
+    forms are replaced by Taylor expansions (following the treatment in
+    ``torch.distributions.ContinuousBernoulli``) so that both the values and
+    their reverse-mode gradients stay finite.
+
+    :param probs: Shape parameter :math:`\lambda \in [0, 1]`. Mutually exclusive
+        with ``logits``.
+    :param logits: Natural (log-odds) parameterization,
+        :math:`\operatorname{logit}(\lambda)`. Mutually exclusive with ``probs``.
+    """
+
+    arg_constraints = {"probs": constraints.unit_interval}
+    support = constraints.unit_interval
+    reparametrized_params = ["probs"]
+    # Threshold band around lambda = 0.5 within which the closed-form
+    # expressions are numerically unstable and Taylor expansions are used
+    # instead (mirrors torch.distributions.ContinuousBernoulli).
+    _lims = (0.499, 0.501)
+
+    def __init__(
+        self,
+        probs: Optional[ArrayLike] = None,
+        logits: Optional[ArrayLike] = None,
+        *,
+        validate_args: Optional[bool] = None,
+    ) -> None:
+        assert_one_of(probs=probs, logits=logits)
+        if probs is not None:
+            (self.probs,) = promote_shapes(probs)
+        else:
+            (self.probs,) = promote_shapes(expit(logits))
+        batch_shape = jnp.shape(self.probs)
+        super().__init__(batch_shape=batch_shape, validate_args=validate_args)
+
+    @lazy_property
+    def logits(self) -> Array:
+        return _to_logits_bernoulli(self.probs)
+
+    def _outside_unstable_region(self) -> Array:
+        return (self.probs <= self._lims[0]) | (self.probs > self._lims[1])
+
+    def _cut_probs(self) -> Array:
+        # First half of the double-``jnp.where`` trick: clamp the unstable
+        # inputs into the safe region *before* evaluating the closed form so
+        # that JAX does not propagate NaN gradients from the singular branch.
+        return jnp.where(
+            self._outside_unstable_region(),
+            self.probs,
+            jnp.full_like(self.probs, self._lims[0]),
+        )
+
+    def _cont_bern_log_norm(self) -> Array:
+        r"""Log normalizing constant :math:`\log C(\lambda)` as a function of
+        ``probs``, with a Taylor expansion inside the ``0.5`` band."""
+        outside = self._outside_unstable_region()
+        cut_probs = self._cut_probs()
+        # Nested ``where`` keeps the argument of each ``log``/``log1p``
+        # non-negative on the branch that is *not* selected, so the dead branch
+        # cannot contribute NaN gradients.
+        cut_probs_below_half = jnp.where(cut_probs <= 0.5, cut_probs, 0.0)
+        cut_probs_above_half = jnp.where(cut_probs >= 0.5, cut_probs, 1.0)
+        log_norm = jnp.log(
+            jnp.abs(jnp.log1p(-cut_probs) - jnp.log(cut_probs))
+        ) - jnp.where(
+            cut_probs <= 0.5,
+            jnp.log1p(-2.0 * cut_probs_below_half),
+            jnp.log(2.0 * cut_probs_above_half - 1.0),
+        )
+        x = jnp.square(self.probs - 0.5)
+        taylor = jnp.log(2.0) + (4.0 / 3.0 + 104.0 / 45.0 * x) * x
+        return jnp.where(outside, log_norm, taylor)
+
+    def sample(
+        self, key: Optional[jax.Array], sample_shape: tuple[int, ...] = ()
+    ) -> Array:
+        r"""Draw samples via the inverse-CDF transform: if
+        :math:`U \sim \mathrm{Uniform}(0, 1)` then :math:`X = F^{-1}(U)` follows
+        the continuous Bernoulli law.
+
+        :param key: A JAX PRNG key.
+        :param sample_shape: Sample dimensions to prepend to the batch shape.
+        :return: Samples in the unit interval.
+        """
+        assert is_prng_key(key)
+        assert key is not None
+        u = random.uniform(key, shape=sample_shape + self.batch_shape)
+        return self.icdf(u)
+
+    @validate_sample
+    def log_prob(self, value: ArrayLike) -> Array:
+        r"""Evaluate the log probability density function at ``value``:
+
+        .. math::
+            \ln p(x \mid \lambda) =
+            x\,\operatorname{logit}(\lambda) + \ln(1 - \lambda) + \ln C(\lambda)
+
+        :param value: Point :math:`x \in [0, 1]` at which to evaluate the log PDF.
+        :return: Log probability density under the continuous Bernoulli.
+        """
+        # value * logit(lam) + log(1 - lam) is -BCE_with_logits(logits, value);
+        # log_sigmoid(-logits) == log(1 - lam) in a numerically stable way.
+        return (
+            value * self.logits
+            + nn.log_sigmoid(-self.logits)
+            + self._cont_bern_log_norm()
+        )
+
+    def icdf(self, value: ArrayLike) -> Array:
+        r"""Inverse cumulative distribution function (quantile function). In the
+        stable region
+
+        .. math::
+            F^{-1}(u) = \frac{\ln\bigl(1 - \lambda + u\,(2\lambda - 1)\bigr)
+            - \ln(1 - \lambda)}{\ln \lambda - \ln(1 - \lambda)}
+
+        and near :math:`\lambda = 0.5` (where the distribution approaches the
+        uniform) the closed form is a removable :math:`0/0` singularity, so it
+        is replaced by the Taylor expansion
+        :math:`F^{-1}(u) = u + 2\,(\lambda - 0.5)\,u\,(1 - u) + O((\lambda -
+        0.5)^2)`. The linear term keeps the reparameterization gradient correct
+        and finite inside the band.
+
+        :param value: Probability value in :math:`[0, 1]`.
+        """
+        outside = self._outside_unstable_region()
+        cut_probs = self._cut_probs()
+        unbounded = (
+            jnp.log1p(-cut_probs + value * (2.0 * cut_probs - 1.0))
+            - jnp.log1p(-cut_probs)
+        ) / (jnp.log(cut_probs) - jnp.log1p(-cut_probs))
+        taylor = value + 2.0 * (self.probs - 0.5) * value * (1.0 - value)
+        return jnp.where(outside, unbounded, taylor)
+
+    @property
+    def mean(self) -> Array:
+        r"""Mean of the continuous Bernoulli distribution:
+
+        .. math::
+            \mathbb{E}[X] = \frac{\lambda}{2\lambda - 1}
+            + \frac{1}{\ln(1 - \lambda) - \ln \lambda}
+        """
+        outside = self._outside_unstable_region()
+        cut_probs = self._cut_probs()
+        mus = cut_probs / (2.0 * cut_probs - 1.0) + 1.0 / (
+            jnp.log1p(-cut_probs) - jnp.log(cut_probs)
+        )
+        x = self.probs - 0.5
+        taylor = 0.5 + (1.0 / 3.0 + 16.0 / 45.0 * jnp.square(x)) * x
+        return jnp.where(outside, mus, taylor)
+
+    @property
+    def variance(self) -> Array:
+        r"""Variance of the continuous Bernoulli distribution:
+
+        .. math::
+            \mathrm{Var}(X) = \frac{\lambda\,(\lambda - 1)}{(1 - 2\lambda)^{2}}
+            + \frac{1}{\bigl(\ln(1 - \lambda) - \ln \lambda\bigr)^{2}}
+        """
+        outside = self._outside_unstable_region()
+        cut_probs = self._cut_probs()
+        variances = cut_probs * (cut_probs - 1.0) / jnp.square(
+            1.0 - 2.0 * cut_probs
+        ) + 1.0 / jnp.square(jnp.log1p(-cut_probs) - jnp.log(cut_probs))
+        x = jnp.square(self.probs - 0.5)
+        taylor = 1.0 / 12.0 - (1.0 / 15.0 - 128.0 / 945.0 * x) * x
+        return jnp.where(outside, variances, taylor)
+
+
 class Dirichlet(Distribution):
     r"""Dirichlet distribution parameterized by concentration (:attr:`concentration`).
 

@@ -563,6 +563,10 @@ CONTINUOUS = [
     T(dist.Cauchy, 0.0, 1.0),
     T(dist.Cauchy, 0.0, np.array([1.0, 2.0])),
     T(dist.Cauchy, np.array([0.0, 1.0]), np.array([[1.0], [2.0]])),
+    T(dist.ContinuousBernoulli, 0.2),
+    T(dist.ContinuousBernoulli, np.array([0.3, 0.7, 0.9])),
+    # exercise the lambda=0.5 removable-singularity / Taylor branch
+    T(dist.ContinuousBernoulli, np.array([0.5, 0.4995, 0.5005])),
     T(_RightCensoredWeibull, 1.0, 1.0, 0),
     T(_RightCensoredWeibull, 1.0, 1.0, 1),
     T(_LeftCensoredHalfNormal, 1.0, 0),

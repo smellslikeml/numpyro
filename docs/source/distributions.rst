@@ -144,6 +144,14 @@ CirculantNormal
     :show-inheritance:
     :member-order: bysource
 
+ContinuousBernoulli
+^^^^^^^^^^^^^^^^^^^^
+.. autoclass:: numpyro.distributions.continuous.ContinuousBernoulli
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :member-order: bysource
+
 Dagum
 ^^^^^
 .. autoclass:: numpyro.distributions.continuous.Dagum
